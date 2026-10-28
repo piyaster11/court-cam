@@ -1,0 +1,2 @@
+{"name":"Court Cam","short_name":"Court Cam","start_url":"./","scope":"./","display":"fullscreen","orientation":"any","background_color":"#020610","theme_color":"#050b18",
+"icons":[{"src":"icon-192.png","sizes":"192x192","type":"image/png"},{"src":"icon-512.png","sizes":"512x512","type":"image/png"},{"src":"icon-512.png","sizes":"512x512","type":"image/png","purpose":"maskable"}]}
