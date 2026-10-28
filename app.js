@@ -1,11 +1,13 @@
 // Court Cam — live sports HUD over the iPhone camera.
 // All speeds / distances are ESTIMATES from a single camera.
 import { FilesetResolver, PoseLandmarker, ObjectDetector } from './vendor/vision_bundle.mjs';
+import { BallTracker } from './balltrack.js';
 
 const $ = (id) => document.getElementById(id);
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const lerp = (a, b, t) => a + (b - a) * t;
-const now = () => performance.now();
+const TSLOW = Math.max(1, +new URLSearchParams(location.search).get('slow') || 1); // test hook: footage replayed at 1/N speed
+const now = () => performance.now() / TSLOW;
 const QS = new URLSearchParams(location.search);
 
 /* ---------------- sports ---------------- */
@@ -39,7 +41,7 @@ const save = () => localStorage.setItem('courtcam.v1', JSON.stringify({ sport: S
 function sp() { return SPORTS[S.sport]; }
 function players() {
   if (!S.players[S.sport]) {
-    const n = S.sport === 'football' ? 6 : 4;
+    const n = S.sport === 'football' ? 6 : S.sport === 'tennis' ? 2 : 4;
     S.players[S.sport] = DEFAULT_NAMES[S.sport].slice(0, n).map((name, i) => ({
       name, rating: [88, 95, 90, 90, 86, 84][i], color: PALETTE[i], team: S.sport === 'football' ? (i < 3 ? 'A' : 'B') : (i < 2 ? 'A' : 'B'),
     }));
@@ -159,7 +161,7 @@ async function startLive(fileUrl) {
     status('Camera blocked: ' + (e.message || e.name) + '. Allow camera access in Settings › Safari › Camera, then reload.'); return;
   }
   status('Loading AI tracking…');
-  if (!running) { running = true; requestAnimationFrame(frame); }
+  if (!running) { running = true; requestAnimationFrame(frame); startFrameCb(); }
   try { await loadModels(); status(''); toast(`Tracking ready (${delegateUsed})${calib() ? '' : ' · Menu › Calibrate for better speed/distance'}`, 3200); scheduleInfer(0); }
   catch (e) { console.error(e); status('Tracking failed to load: ' + e.message + '. HUD still works with manual controls.'); }
   if (S.mic) enableMic();
@@ -244,7 +246,9 @@ function infer() {
   } catch (e) { console.warn('infer', e); }
   const cost = now() - t0; G.inferMs = lerp(G.inferMs || cost, cost, 0.2);
   const target = S.sport === 'football' ? 1000 / 12 : 1000 / 22;
-  scheduleInfer(Math.max(target - cost, cost * 0.5, 12));
+  // ball sports: when inference is slow (CPU), leave the main thread free between runs so the per-frame ball tracker keeps up
+  const yieldK = s.ball && G.inferMs > 30 ? 1.3 : 0.5;
+  scheduleInfer(Math.max(target - cost, cost * yieldK, 12));
 }
 function runPose(t) {
   tsPose = Math.max(tsPose + 1, Math.round(t));
@@ -281,7 +285,12 @@ function filterDets(dets) {
     if (out.some((o) => Math.hypot(o.x - d.x, o.y - d.y) < 0.35 * Math.max(o.h, d.h))) continue;
     const [cx_, cy_] = v2c(d.x, d.y); if (cx_ < -0.02 * W || cx_ > W * 1.02 || cy_ < 0 || cy_ > H * 1.05) continue; // cropped out of view
     const c = toCourt(d.x, d.y);
-    if (c) { const [w, l] = dims(), m = S.sport === 'football' ? 4 : 2.5; if (c[0] < -m || c[0] > w + m || c[1] < -m || c[1] > l + m) continue; }
+    if (c) {
+      const [w, l] = dims(), ms = S.sport === 'football' ? 4 : S.sport === 'tennis' ? 3 : 2.5, me = S.sport === 'football' ? 4 : S.sport === 'tennis' ? 7.5 : 2.5;
+      if (c[0] < -ms || c[0] > w + ms || c[1] < -me || c[1] > l + me) continue;
+      // tennis: umpire chair, benches and net-post ball kids sit just outside the sidelines near the net
+      if (S.sport === 'tennis' && Math.abs(c[1] - l / 2) < 3.5 && (c[0] < -0.4 || c[0] > w + 0.4)) continue;
+    }
     out.push(d);
   }
   return out.slice(0, Math.max(players().length + 2, 4));
@@ -379,13 +388,11 @@ function runDet(t) {
     if (c.categoryName === 'sports ball') balls.push({ x: b.originX + b.width / 2, y: b.originY + b.height / 2, r: Math.max(b.width, b.height) / 2, score: c.score, src: 'det' });
     else if (c.categoryName === 'person' && c.score > 0.3) people.push({ x: b.originX + b.width / 2, y: b.originY + b.height, h: b.height, top: b.originY });
   }
-  G.nPeople = people.length; G.nBalls = balls.length;
+  G.nPeople = people.length; G.nBalls = balls.length; G.peopleBoxes = people; G.peopleT = t;
   updateTracks(filterDets(people), t);
   if (!sp().ball) return;
-  const motion = grabMotion(t);
-  let m = pickBall(balls, t);
-  if (!m) m = motion;
-  updateBall(m, t);
+  const m = pickBall(balls, t);
+  if (m && m.score > 0.35) btSeed(m, t); // the per-frame motion tracker (btFrame) does the rest
 }
 function predBall(t) { const b = G.ball; if (!b) return null; const dt = Math.min((t - b.t) / 1000, 0.5); return [b.x + b.vx * dt, b.y + b.vy * dt]; }
 function pickBall(balls, t) {
@@ -399,49 +406,45 @@ function pickBall(balls, t) {
   balls.sort((a, b) => b.score - a.score);
   return balls[0].score > 0.28 ? balls[0] : null;
 }
-function grabMotion(t) {
-  // simple motion + colour tracker on a tiny frame, only searched near the predicted ball position
-  if (!tiny) { tiny = document.createElement('canvas'); tctx = tiny.getContext('2d', { willReadFrequently: true }); }
-  TW = 160; TH = Math.max(40, Math.round(160 * VH / VW));
-  if (tiny.width !== TW || tiny.height !== TH) { tiny.width = TW; tiny.height = TH; prevLuma = null; }
-  tctx.drawImage(video, 0, 0, TW, TH);
-  const px = tctx.getImageData(0, 0, TW, TH).data, luma = new Uint8ClampedArray(TW * TH);
-  for (let i = 0, j = 0; j < luma.length; i += 4, j++) luma[j] = (px[i] * 77 + px[i + 1] * 150 + px[i + 2] * 29) >> 8;
-  let res = null;
-  const p = predBall(t);
-  if (prevLuma && p && t - G.ball.t < 1000) {
-    const sx = TW / VW, cx = p[0] * sx, cy = p[1] * sx, sp0 = Math.hypot(G.ball.vx, G.ball.vy) * sx;
-    const R = clamp(8 + (t - G.ball.t) / 1000 * 60 + sp0 * 0.12 + (sp0 < 1 ? 14 : 0), 8, 44);
-    const x0 = Math.max(0, cx - R | 0), x1 = Math.min(TW, cx + R | 0), y0 = Math.max(0, cy - R | 0), y1 = Math.min(TH, cy + R | 0);
-    const mw = x1 - x0, mh = y1 - y0;
-    if (mw > 2 && mh > 2) {
-      const mask = new Uint8Array(mw * mh);
-      for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) {
-        const j = y * TW + x, d = Math.abs(luma[j] - prevLuma[j]);
-        const i = j * 4, r = px[i], g = px[i + 1], b = px[i + 2];
-        const ok = S.sport === 'tennis' ? (g > 95 && r > 70 && b < g * 0.72 && (d > 14 || r < g * 1.05)) : d > 40;
-        if (!ok) continue;
-        if (G.tracks.some((k) => Math.abs(x / sx - k.x) < k.h * 0.18 && y / sx > k.top && y / sx < k.y - k.h * 0.12)) continue;
-        mask[(y - y0) * mw + (x - x0)] = 1;
-      }
-      // connected blobs; keep ball-sized ones, choose nearest to prediction
-      const maxA = Math.max(6, (G.ball.r * sx * 2.2) ** 2 + 6);
-      let best = null, bd = 1e9; const st = [];
-      for (let q = 0; q < mask.length; q++) {
-        if (mask[q] !== 1) continue;
-        let n = 0, ax = 0, ay = 0; st.push(q); mask[q] = 2;
-        while (st.length) { const u = st.pop(), ux = u % mw, uy = (u / mw) | 0; n++; ax += ux; ay += uy;
-          if (ux > 0 && mask[u - 1] === 1) { mask[u - 1] = 2; st.push(u - 1); } if (ux < mw - 1 && mask[u + 1] === 1) { mask[u + 1] = 2; st.push(u + 1); }
-          if (uy > 0 && mask[u - mw] === 1) { mask[u - mw] = 2; st.push(u - mw); } if (uy < mh - 1 && mask[u + mw] === 1) { mask[u + mw] = 2; st.push(u + mw); } }
-        if (n > maxA) continue;
-        const bx = x0 + ax / n, by = y0 + ay / n, d = Math.hypot(bx - cx, by - cy) - Math.min(n, 6) * 0.3;
-        if (d < bd) { bd = d; best = { x: bx / sx, y: by / sx, r: Math.max(3, Math.sqrt(n) * 0.6) / sx, score: 0.2, src: 'motion' }; }
-      }
-      res = best;
-    }
+/* Per-frame ball tracker (balltrack.js): motion-compensated 3-frame differencing at ~800 px inside the court ROI,
+   small-blob candidates, flicker heat-map suppression, multi-hypothesis tracklets; a tracklet is reported once it
+   has been consistent for 6 frames. Works for balls far too small for the object detector (2-6 px). */
+const BT = { cv: null, cx: null, w: 0, h: 0, roi: null, tr: new BallTracker({ tennis: true, T: 16, confirmN: 6 }), frames: 0, hits: 0, busy: 0 };
+G.bt = BT;
+function btRoi(scale, w, h) {
+  // court bounding box (+ margins and air space above it) in tracker pixels; whole frame when uncalibrated
+  const c = calibValid(); if (!c) return [0, Math.round(h * 0.08), w, h];
+  const [cw, cl] = dims(), mx = S.sport === 'tennis' ? 5 : 4, my = S.sport === 'tennis' ? 9 : 5;
+  let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+  for (const [X, Y] of [[-mx, -my], [cw + mx, -my], [cw + mx, cl + my], [-mx, cl + my], [cw / 2, -my], [cw / 2, cl + my]]) {
+    const p = fromCourt(X, Y); if (!p) continue; x0 = Math.min(x0, p[0]); x1 = Math.max(x1, p[0]); y0 = Math.min(y0, p[1]); y1 = Math.max(y1, p[1]);
   }
-  prevLuma = luma;
-  return res;
+  const air = (y1 - y0) * 0.55; y0 -= air; // balls fly well above the court plane
+  const r = [x0 * scale, y0 * scale, x1 * scale, y1 * scale].map(Math.round);
+  r[0] = clamp(r[0], 0, w); r[2] = clamp(r[2], 0, w); r[1] = clamp(r[1], 0, h); r[3] = clamp(r[3], 0, h);
+  return r[2] - r[0] < 32 || r[3] - r[1] < 32 ? [0, 0, w, h] : r;
+}
+function btSeed(m, t) { updateBall(m, t); BT.hitT = t; }
+function btFrame(t) {
+  if (!sp().ball || video.readyState < 2 || !VW) return;
+  const scale = Math.min(1, 800 / Math.max(VW, VH)), w = Math.round(VW * scale), h = Math.round(VH * scale);
+  if (!BT.cv) { BT.cv = document.createElement('canvas'); BT.cx = BT.cv.getContext('2d', { willReadFrequently: true }); }
+  if (BT.w !== w || BT.h !== h) { BT.cv.width = w; BT.cv.height = h; BT.w = w; BT.h = h; BT.roi = null; }
+  const roi = btRoi(scale, w, h);
+  if (!BT.roi || roi.some((v, k) => Math.abs(v - BT.roi[k]) > 6)) BT.roi = roi; // tracker resets itself when the ROI size changes
+  const [rx, ry, rx1, ry1] = BT.roi, rw = rx1 - rx, rh = ry1 - ry;
+  BT.cx.drawImage(video, 0, 0, w, h);
+  const px = BT.cx.getImageData(rx, ry, rw, rh).data;
+  const boxes = [];
+  for (const d of (t - (G.peopleT || 0) < 600 ? G.peopleBoxes || [] : [])) boxes.push([(d.x - d.h * 0.42) * scale - rx, (d.top - d.h * 0.12) * scale - ry, (d.x + d.h * 0.42) * scale - rx, (d.y + d.h * 0.06) * scale - ry]);
+  const tr = BT.tr, got = tr.push(px, rw, rh, t, boxes);
+  BT.frames = tr.frames; BT.busy = tr.skipped;
+  if (window.__btLog && window.__btLog.length < 400) window.__btLog.push([Math.round(t), rw, rh, tr.c1.length, tr.tracks.length, Math.max(0, ...tr.tracks.map((k) => k.n)), tr.sh1.join(',')]);
+  if (!got) return;
+  const gx = got.x + rx, gy = got.y + ry;
+  if (window.__btDbg && BT.hits % 2 === 0 && window.__btDbg.length < 72) { const c = document.createElement('canvas'); c.width = c.height = 48; const g = c.getContext('2d'); g.imageSmoothingEnabled = false; g.drawImage(BT.cv, gx - 12, gy - 12, 24, 24, 0, 0, 48, 48); g.strokeStyle = got.turn ? '#0ff' : '#f0f'; g.strokeRect(18, 18, 12, 12); window.__btDbg.push(c.toDataURL()); }
+  BT.hits++; BT.hitT = t;
+  updateBall({ x: gx / scale, y: gy / scale, r: clamp(Math.sqrt(got.a) * 0.7 / scale, 2.5 / scale, 10 / scale), score: 0.3, src: 'motion', turn: !!got.turn }, t);
 }
 function ballMetric(x, y) {
   const c = toCourt(x, y); if (c) return c;
@@ -457,8 +460,8 @@ function updateBall(m, t) {
   if (!b || t - b.t > 1000) { G.ball = { x: m.x, y: m.y, vx: 0, vy: 0, t, r: m.r, trail: [{ x: m.x, y: m.y, t }], hist: [{ t, p: ballMetric(m.x, m.y) }], kmh: 0, src: m.src, born: t }; return; }
   const dt = Math.max((t - b.t) / 1000, 0.016), p = predBall(t);
   const gate = Math.max(VW * (b.hist.length < 3 ? 0.2 : 0.12), Math.hypot(b.vx, b.vy) * dt * 1.6);
-  if (Math.hypot(m.x - p[0], m.y - p[1]) > gate && !(m.src === 'det' && m.score > 0.5)) return;
-  b.vx = lerp(b.vx, (m.x - b.x) / dt, 0.6); b.vy = lerp(b.vy, (m.y - b.y) / dt, 0.6);
+  if (Math.hypot(m.x - p[0], m.y - p[1]) > gate && !m.turn && !(m.src === 'det' && m.score > 0.5)) return;
+  const k_ = m.turn ? 1 : 0.6; b.vx = lerp(b.vx, (m.x - b.x) / dt, k_); b.vy = lerp(b.vy, (m.y - b.y) / dt, k_);
   b.x = m.x; b.y = m.y; b.t = t; b.r = lerp(b.r, m.r, 0.3); b.src = m.src;
   b.trail.push({ x: b.x, y: b.y, t }); while (b.trail.length && t - b.trail[0].t > 700) b.trail.shift();
   b.hist.push({ t, p: ballMetric(b.x, b.y) }); while (b.hist.length && t - b.hist[0].t > 1200) b.hist.shift();
@@ -503,11 +506,12 @@ function hit(auto) {
   if (auto && t - r.lastHit < 260) return;
   if (!r.on && S.sport !== 'football') { r.acc = 0; r.count = 0; r.on = true; r.t0 = t; syncControls(); }
   r.count++; r.lastHit = t; r.bump = t;
-  // if pose didn't catch the swing, fall back to a rough heuristic (labelled est.): lock on the most active nearby player
+  // if pose didn't catch the swing: lock on the most active nearby player, speed unknown (—)
   if (S.sport === 'badminton' && t - G.shot.t > 600) {
     let best = null, bv = -1;
     for (const k of G.tracks) { if (k.slot < 0 || t - k.t > 800) continue; const v = Math.hypot(k.vx, k.vy) * mppOf(k.h) + (k.wristMs || 0) * 0.5; if (v > bv) { bv = v; best = k; } }
-    if (best) { const s = sp(), kmh = clamp(85 + bv * 22 + (k_rand() - 0.5) * 30, s.speed[0], 260); setShot(kmh, t); lockOn(best, kmh, t); }
+    // no swing was measured => show a dash, never a made-up number
+    if (best) { G.shot.val = 0; G.shot.t = t; lockOn(best, 0, t); }
   }
 }
 let seed_ = 7; function k_rand() { seed_ = (seed_ * 16807) % 2147483647; return seed_ / 2147483647; }
@@ -664,7 +668,7 @@ function drawLock(k, pl, t, tagBox) {
   ctx.font = F(1.8 * U, 700); ctx.fillStyle = '#1a1400'; ctx.fillText('LOCK ON', 1 * U, 1.25 * U);
   ctx.textAlign = 'right'; ctx.fillText(pl.name, lw - U, 1.25 * U);
   ctx.textAlign = 'left'; ctx.font = F(3.6 * U, 700, true);
-  const kmh = Math.round(L.kmh * clamp(age / 450, 0, 1)); // count-up
+  const kmh = L.kmh ? Math.round(L.kmh * clamp(age / 450, 0, 1)) : '—'; // count-up; — when not measured
   ctx.fillStyle = '#fff'; ctx.fillText(`${kmh}`, 1 * U, 4.9 * U);
   const kw = ctx.measureText(`${kmh}`).width; ctx.font = F(1.9 * U, 700); ctx.fillStyle = '#9fe9ff'; ctx.fillText('km/h', 1.6 * U + kw, 5.3 * U);
   ctx.font = F(1.6 * U, 700); ctx.fillStyle = '#ffd23d'; ctx.textAlign = 'right'; ctx.fillText('est.', lw - U, 5.3 * U);
@@ -748,7 +752,7 @@ function drawTopBar(t, dt) {
   G.shot.disp = lerp(G.shot.disp, G.shot.val, Math.min(1, dt * 7));
   const sx = x + seg * 2 + 1.6 * U;
   ctx.font = F(big, 700, true); ctx.textAlign = 'left';
-  const sv = G.shot.val ? String(Math.round(G.shot.disp)) : '--';
+  const sv = G.shot.val ? String(Math.round(G.shot.disp)) : '—';
   const fl = G.shot.t && t - G.shot.t < 500 ? 1 - (t - G.shot.t) / 500 : 0;
   glowText(sv, sx, valY, fl ? '#ffd23d' : s.accent, (1.2 + fl * 2) * U);
   const vw = ctx.measureText(sv).width;
@@ -874,8 +878,15 @@ cv.addEventListener('pointerdown', (e) => {
 
 /* ---------------- frame loop ---------------- */
 let lastF = now(), fpsAcc = 0, fpsN = 0;
+let lastVT = -1, rvfc = false;
+function startFrameCb() {
+  if (!('requestVideoFrameCallback' in HTMLVideoElement.prototype)) return;
+  rvfc = true; const cb = (n) => { video.requestVideoFrameCallback(cb); if ($('live').classList.contains('active')) { try { btFrame(now()); } catch (e) { console.warn('bt', e); } } };
+  video.requestVideoFrameCallback(cb);
+}
 function frame() {
   requestAnimationFrame(frame);
+  if (!rvfc && video.currentTime !== lastVT) { lastVT = video.currentTime; try { btFrame(now()); } catch (e) {} }
   if (!$('live').classList.contains('active')) return;
   const t = now(), dt = Math.min(0.1, (t - lastF) / 1000); lastF = t;
   fpsAcc += dt; fpsN++; if (fpsAcc > 0.5) { G.fps = fpsN / fpsAcc; fpsAcc = 0; fpsN = 0; }
@@ -988,7 +999,7 @@ function finishRec(mime, audio) {
   $('resVid').src = recUrl; $('rDl').href = recUrl; $('rDl').download = recFile.name;
   $('rNote').textContent = `${(blob.size / 1e6).toFixed(1)} MB · ${ext.toUpperCase()}${audio ? ' · with mic audio' : ' · no audio'}. On iPhone tap Save → “Save Video” to put it in Photos.`;
   $('result').classList.remove('hidden');
-  window.__lastRec = { size: blob.size, type, name: recFile.name };
+  window.__lastRec = { size: blob.size, type, name: recFile.name }; window.__lastRecBlob = blob;
 }
 $('rShare').onclick = async () => {
   if (!recFile) return;
