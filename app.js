@@ -1,7 +1,7 @@
 // Court Cam — live sports HUD over the iPhone camera.
 // All speeds / distances are ESTIMATES from a single camera.
 import { FilesetResolver, PoseLandmarker, ObjectDetector } from './vendor/vision_bundle.mjs';
-import { BallTracker } from './balltrack.js';
+import { BallTracker, buildZone } from './balltrack.js';
 import { BallDisplay } from './balldisplay.js';
 
 const $ = (id) => document.getElementById(id);
@@ -313,7 +313,7 @@ function updateTracks(dets, t) {
     if (ut.has(i) || ud.has(j)) continue; ut.add(i); ud.add(j);
     const k = tr[i], d = dets[j], dt = Math.max((t - k.t) / 1000, 0.016);
     k.vx = lerp(k.vx, (d.x - k.x) / dt, 0.35); k.vy = lerp(k.vy, (d.y - k.y) / dt, 0.35);
-    k.x = d.x; k.y = d.y; k.h = lerp(k.h, d.h, 0.35); k.top = d.top; k.t = t; k.seen++;
+    k.x = d.x; k.y = d.y; k.h = lerp(k.h, d.h, 0.35); k.top = d.top; k.t = t; k.seen++; k.mx = Math.max(k.mx || 0, Math.hypot(d.x - k.sx, d.y - k.sy) / k.h); (k.rh ||= []).push([t, d.x, d.y]); while (k.rh.length && t - k.rh[0][0] > 3000) k.rh.shift();
     if (k.seen === 2) k.appear = t;
   }
   dets.forEach((d, j) => {
@@ -344,8 +344,19 @@ function updateTracks(dets, t) {
 }
 function assignSlots() {
   const n = players().length, taken = new Set(G.tracks.filter((k) => k.slot >= 0 && k.slot < n).map((k) => k.slot));
-  G.tracks.forEach((k) => { if (k.slot >= n) k.slot = -1; });
-  const cands = G.tracks.filter((k) => k.slot < 0 && k.seen >= 3).sort((a, b) => b.h - a.h);
+  // a person who has not moved for seconds (umpire in the chair, line judge, ball kid) is never a player
+  // and anyone parked off the court (sideline benches, chair, ball kids) is only a player while actually moving
+  const still = (k) => {
+    if (now() - k.born < 2500) return false;
+    if ((k.mx || 0) < 0.18) return true;
+    const c = toCourt(k.x, k.y); if (!c) return false;
+    const [w, l] = dims(), off = c[0] < -0.6 || c[0] > w + 0.6 || c[1] < -6 || c[1] > l + 6;
+    if (!off || !k.rh || k.rh.length < 4) return false;
+    let x0 = 1e9, x1 = -1e9, y0 = 1e9, y1 = -1e9; for (const [, x, y] of k.rh) { x0 = Math.min(x0, x); x1 = Math.max(x1, x); y0 = Math.min(y0, y); y1 = Math.max(y1, y); }
+    return Math.hypot(x1 - x0, y1 - y0) < 0.35 * k.h;
+  };
+  G.tracks.forEach((k) => { if (k.slot >= n || (k.slot >= 0 && still(k))) { taken.delete(k.slot); k.slot = -1; } });
+  const cands = G.tracks.filter((k) => k.slot < 0 && k.seen >= 3 && !still(k)).sort((a, b) => (b.mx || 0) - (a.mx || 0) || b.h - a.h);
   for (const k of cands) {
     let best = -1, bd = 1e12;
     for (let s = 0; s < n; s++) {
@@ -412,7 +423,7 @@ function pickBall(balls, t) {
    has been consistent for 6 frames. Works for balls far too small for the object detector (2-6 px). */
 const BT = { cv: null, cx: null, w: 0, h: 0, roi: null, tr: new BallTracker({ tennis: true, T: 16, confirmN: 6 }), frames: 0, hits: 0, busy: 0 };
 G.bt = BT;
-const BD = new BallDisplay(); G.bd = BD; G.fx = [];
+const BD = new BallDisplay({ coast: 350, fadeStart: 120 }); G.bd = BD; G.fx = [];
 function btRoi(scale, w, h) {
   // court bounding box (+ margins and air space above it) in tracker pixels; whole frame when uncalibrated
   const c = calibValid(); if (!c) return [0, Math.round(h * 0.08), w, h];
@@ -426,7 +437,29 @@ function btRoi(scale, w, h) {
   r[0] = clamp(r[0], 0, w); r[2] = clamp(r[2], 0, w); r[1] = clamp(r[1], 0, h); r[3] = clamp(r[3], 0, h);
   return r[2] - r[0] < 32 || r[3] - r[1] < 32 ? [0, 0, w, h] : r;
 }
-function btSeed(m, t) { updateBall(m, t); BT.hitT = t; BD.setFrame(VW, VH); BD.meas(m.x, m.y, t, { id: 'det' }); }
+// play volume (court + margins + air above) per sport, in metres: side / end margin, max height in / out of court
+const ZONE_OPT = { tennis: { side: 3.5, end: 5, hIn: 7, hOut: 2.5 }, badminton: { side: 1.5, end: 1.5, hIn: 8, hOut: 3 }, football: { side: 3, end: 3, hIn: 12, hOut: 4 } };
+function btZone(scale, rx, ry, rw, rh) {
+  const c = calibValid(), key = c ? [S.sport, rx, ry, rw, rh, scale, ...c.pts.flat(), ...dims()].join(',') : 'none,' + [rx, ry, rw, rh].join(',');
+  if (BT.zoneKey === key) return; BT.zoneKey = key;
+  if (c) BT.zone = buildZone((X, Y) => { const p = fromCourt(X, Y); return p && [p[0] * scale, p[1] * scale]; }, dims(), rw, rh, rx, ry, ZONE_OPT[S.sport] || {});
+  else { // uncalibrated: keep away from the frame edges (stands / scoreboard / graphics usually live there)
+    const top = new Float32Array(rw), bot = new Float32Array(rw);
+    for (let x = 0; x < rw; x++) { const e = x < rw * 0.04 || x > rw * 0.96; top[x] = e ? 1e9 : rh * 0.1; bot[x] = e ? -1e9 : rh * 0.97; }
+    BT.zone = { w: rw, h: rh, top, bot };
+  }
+  BT.zs = { scale, rx, ry }; BT.tr.setZone(BT.zone);
+}
+function inZone(x, y) { // video px
+  const Z = BT.zone, q = BT.zs; if (!Z || !q) return true;
+  const xi = Math.round(x * q.scale - q.rx), yy = y * q.scale - q.ry; if (xi < 0 || xi >= Z.w) return false;
+  return yy >= Z.top[xi] - 2 && yy <= Z.bot[xi] + 2;
+}
+function btSeed(m, t) {
+  // detector hits only refresh a ball that the motion tracker is already following (never start one: logos / heads)
+  if (!inZone(m.x, m.y)) return;
+  const p = BD.render(t, true); if (!p || Math.hypot(p.x - m.x, p.y - m.y) > VW * 0.05) return;
+  updateBall(m, t); BT.hitT = t; BD.setFrame(VW, VH); BD.meas(m.x, m.y, t, { id: 'det' }); }
 function btFrame(t) {
   if (!sp().ball || video.readyState < 2 || !VW) return;
   const scale = Math.min(1, 800 / Math.max(VW, VH)), w = Math.round(VW * scale), h = Math.round(VH * scale);
@@ -435,16 +468,17 @@ function btFrame(t) {
   const roi = btRoi(scale, w, h);
   if (!BT.roi || roi.some((v, k) => Math.abs(v - BT.roi[k]) > 6)) BT.roi = roi; // tracker resets itself when the ROI size changes
   const [rx, ry, rx1, ry1] = BT.roi, rw = rx1 - rx, rh = ry1 - ry;
+  btZone(scale, rx, ry, rw, rh);
   BT.cx.drawImage(video, 0, 0, w, h);
   const px = BT.cx.getImageData(rx, ry, rw, rh).data;
   const boxes = [];
   for (const d of (t - (G.peopleT || 0) < 600 ? G.peopleBoxes || [] : [])) boxes.push([(d.x - d.h * 0.42) * scale - rx, (d.top - d.h * 0.12) * scale - ry, (d.x + d.h * 0.42) * scale - rx, (d.y + d.h * 0.06) * scale - ry]);
   const tr = BT.tr, got = tr.push(px, rw, rh, t, boxes);
   BT.frames = tr.frames; BT.busy = tr.skipped;
-  if (window.__btLog && window.__btLog.length < 400) window.__btLog.push([Math.round(t), rw, rh, tr.c1.length, tr.tracks.length, Math.max(0, ...tr.tracks.map((k) => k.n)), tr.sh1.join(',')]);
+  if (window.__btLog && window.__btLog.length < 400) window.__btLog.push([Math.round(t), rw, rh, tr.c1.length, tr.tracks.length, Math.max(0, ...tr.tracks.map((k) => k.n)), tr.sh1.join(','), JSON.stringify(tr.vf || {})]);
   if (!got) return;
   const gx = got.x + rx, gy = got.y + ry;
-  if (window.__btDbg && BT.hits % 2 === 0 && window.__btDbg.length < 72) { const c = document.createElement('canvas'); c.width = c.height = 48; const g = c.getContext('2d'); g.imageSmoothingEnabled = false; g.drawImage(BT.cv, gx - 12, gy - 12, 24, 24, 0, 0, 48, 48); g.strokeStyle = got.turn ? '#0ff' : '#f0f'; g.strokeRect(18, 18, 12, 12); window.__btDbg.push(c.toDataURL()); }
+  if (window.__btDbg && window.__btDbg.length < 144) { const c = document.createElement('canvas'); c.width = c.height = 48; const g = c.getContext('2d'); g.drawImage(BT.cv, gx - 32, gy - 32, 64, 64, 0, 0, 48, 48); g.strokeStyle = got.turn ? '#0ff' : '#f0f'; g.strokeRect(20, 20, 8, 8); window.__btDbg.push(c.toDataURL()); }
   BT.hits++; BT.hitT = t;
   updateBall({ x: gx / scale, y: gy / scale, r: clamp(Math.sqrt(got.a) * 0.7 / scale, 2.5 / scale, 10 / scale), score: 0.3, src: 'motion', turn: !!got.turn }, t);
   BD.setFrame(VW, VH);
@@ -712,7 +746,8 @@ function addFx(x, y, t, kind, k) { if (G.fx.length > 8) G.fx.shift(); G.fx.push(
 function drawBall(t) {
   const s = sp(), b = G.ball;
   BD.setFrame(VW, VH); BD.kmh = b && b.kmhS ? b.kmhS : (b ? b.kmh : 0);
-  const r = BD.render(t), TR = BD.trailPts(t), TMS = BD.o.trailMs;
+  let r = BD.render(t); const TR = BD.trailPts(t).filter((p) => inZone(p.x, p.y)), TMS = BD.o.trailMs;
+  if (r && !inZone(r.x, r.y)) r = null; // never draw a ball (or its coast) outside the play volume
   const football = S.sport === 'football';
   ctx.save(); ctx.globalCompositeOperation = 'lighter'; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
   // ---- trail: per segment, decimate to ~30 ms knots, spline, tapered + glow, colour by speed
