@@ -23,7 +23,7 @@ export class BallTracker {
     let sh = [0, 0];
     if (L1) sh = this.shift(L, L1, rw, rh);
     const sh2 = [sh[0] + this.sh1[0], sh[1] + this.sh1[1]];
-    this.L2 = L1; this.D2 = D1; this.t2 = t1; this.L1 = L; this.D1 = D; this.t1 = t; this.sh1 = sh;
+    this.pt = [this.t2, t1]; this.L2 = L1; this.D2 = D1; this.t2 = t1; this.L1 = L; this.D1 = D; this.t1 = t; this.sh1 = sh;
     if (!D1 || !D2) return null;
     this.frames++;
     // candidates: brighter than the (motion-compensated) neighbourhood in BOTH previous frames
@@ -96,14 +96,14 @@ export class BallTracker {
       if (got) {
         used.add(got);
         const vx = (got.x - k.x) / kt, vy = (got.y - k.y) / kt, a = turn ? 1 : 0.6;
-        k.vx += (vx - k.vx) * a; k.vy += (vy - k.vy) * a; k.x = got.x; k.y = got.y; k.t = t; k.miss = 0; k.n++; k.a = got.a; k.turn = turn; k.col = k.col * 0.7 + got.col * 0.3;
+        k.vx += (vx - k.vx) * a; k.vy += (vy - k.vy) * a; k.x = got.x; k.y = got.y; k.t = t; k.miss = 0; k.n++; k.a = got.a; k.turn = turn; k.col = k.col * 0.7 + got.col * 0.3; k.h.push([got.x, got.y, t]); if (k.h.length > 12) k.h.shift();
         k.slow = Math.hypot(k.vx, k.vy) * dt < minStep * 0.6 ? k.slow + 1 : 0;
       } else { k.miss++; k.turn = false; }
     }
     this.tracks = this.tracks.filter((k) => k.miss <= (k.n >= o.confirmN ? 6 : 1) && k.slow < 3 && t - k.t < 300);
     // 2. births: three detections in a straight, evenly spaced line over consecutive frames
     if (this.c1.length && this.c2.length) {
-      const d1 = Math.max((this.t1 - this.t2) / 1000, 0.005);
+      const d1 = Math.max(((this.pt[1] || 0) - (this.pt[0] || 0)) / 1000, 0.005) || dt;
       const births = [];
       for (const c2 of C) {
         if (used.has(c2)) continue;
@@ -116,10 +116,10 @@ export class BallTracker {
             const ex = c1.x - vx * d1 - c0.x, ey = c1.y - vy * d1 - c0.y, err = Math.hypot(ex, ey);
             if (err > 0.35 * s2 + 2) continue;
             const sc = err / (s2 + 1) + (c0.heat + c1.heat + c2.heat) * 0.3;
-            if (sc < bs) { bs = sc; best = { c1, vx, vy, col: (c0.col + c1.col + c2.col) / 3 }; }
+            if (sc < bs) { bs = sc; best = { c0, c1, vx, vy, col: (c0.col + c1.col + c2.col) / 3 }; }
           }
         }
-        if (best) births.push({ id: this.nextId++, x: c2.x, y: c2.y, vx: best.vx, vy: best.vy, t, n: 3, miss: 0, slow: 0, a: c2.a, sc: bs, col: best.col });
+        if (best) births.push({ id: this.nextId++, x: c2.x, y: c2.y, vx: best.vx, vy: best.vy, t, n: 3, miss: 0, slow: 0, a: c2.a, sc: bs, col: best.col, h: [[best.c0.x, best.c0.y, this.pt[0]], [best.c1.x, best.c1.y, this.pt[1]], [c2.x, c2.y, t]] });
       }
       births.sort((a, b) => a.sc - b.sc);
       for (const b of births) { if (this.tracks.length >= o.maxTracks) break; if (this.tracks.some((k) => Math.hypot(k.x - b.x, k.y - b.y) < 4)) continue; this.tracks.push(b); }
@@ -127,6 +127,8 @@ export class BallTracker {
     // 3. report the best confirmed tracklet updated this frame
     let rep = null;
     for (const k of this.tracks) if (k.n >= o.confirmN && k.t === t && (!rep || k.n > rep.n)) rep = k;
-    return rep ? { x: rep.x, y: rep.y, a: rep.a, turn: rep.turn, id: rep.id, n: rep.n, col: rep.col } : null;
+    if (!rep) return null;
+    const back = rep.rep ? null : rep.h.slice(0, -1); rep.rep = true; // first report: hand back the frames it took to confirm
+    return { x: rep.x, y: rep.y, a: rep.a, turn: rep.turn, id: rep.id, n: rep.n, col: rep.col, back };
   }
 }

@@ -2,6 +2,7 @@
 // All speeds / distances are ESTIMATES from a single camera.
 import { FilesetResolver, PoseLandmarker, ObjectDetector } from './vendor/vision_bundle.mjs';
 import { BallTracker } from './balltrack.js';
+import { BallDisplay } from './balldisplay.js';
 
 const $ = (id) => document.getElementById(id);
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
@@ -143,7 +144,7 @@ async function loadModels() {
 /* ---------------- start / stop live ---------------- */
 async function startLive(fileUrl) {
   show('live'); resetStats(); syncControls(); status('Starting camera…');
-  G.tracks = []; G.ball = null; G.poss = { A: 0, B: 0, last: null };
+  G.tracks = []; G.ball = null; G.poss = { A: 0, B: 0, last: null }; if (G.bd) G.bd.reset(); G.fx = [];
   try {
     stopSource();
     if (fileUrl) {
@@ -411,6 +412,7 @@ function pickBall(balls, t) {
    has been consistent for 6 frames. Works for balls far too small for the object detector (2-6 px). */
 const BT = { cv: null, cx: null, w: 0, h: 0, roi: null, tr: new BallTracker({ tennis: true, T: 16, confirmN: 6 }), frames: 0, hits: 0, busy: 0 };
 G.bt = BT;
+const BD = new BallDisplay(); G.bd = BD; G.fx = [];
 function btRoi(scale, w, h) {
   // court bounding box (+ margins and air space above it) in tracker pixels; whole frame when uncalibrated
   const c = calibValid(); if (!c) return [0, Math.round(h * 0.08), w, h];
@@ -424,7 +426,7 @@ function btRoi(scale, w, h) {
   r[0] = clamp(r[0], 0, w); r[2] = clamp(r[2], 0, w); r[1] = clamp(r[1], 0, h); r[3] = clamp(r[3], 0, h);
   return r[2] - r[0] < 32 || r[3] - r[1] < 32 ? [0, 0, w, h] : r;
 }
-function btSeed(m, t) { updateBall(m, t); BT.hitT = t; }
+function btSeed(m, t) { updateBall(m, t); BT.hitT = t; BD.setFrame(VW, VH); BD.meas(m.x, m.y, t, { id: 'det' }); }
 function btFrame(t) {
   if (!sp().ball || video.readyState < 2 || !VW) return;
   const scale = Math.min(1, 800 / Math.max(VW, VH)), w = Math.round(VW * scale), h = Math.round(VH * scale);
@@ -445,6 +447,8 @@ function btFrame(t) {
   if (window.__btDbg && BT.hits % 2 === 0 && window.__btDbg.length < 72) { const c = document.createElement('canvas'); c.width = c.height = 48; const g = c.getContext('2d'); g.imageSmoothingEnabled = false; g.drawImage(BT.cv, gx - 12, gy - 12, 24, 24, 0, 0, 48, 48); g.strokeStyle = got.turn ? '#0ff' : '#f0f'; g.strokeRect(18, 18, 12, 12); window.__btDbg.push(c.toDataURL()); }
   BT.hits++; BT.hitT = t;
   updateBall({ x: gx / scale, y: gy / scale, r: clamp(Math.sqrt(got.a) * 0.7 / scale, 2.5 / scale, 10 / scale), score: 0.3, src: 'motion', turn: !!got.turn }, t);
+  BD.setFrame(VW, VH);
+  BD.meas(gx / scale, gy / scale, t, { turn: !!got.turn, id: got.id, back: got.back && got.back.map(([x, y, tt]) => [(x + rx) / scale, (y + ry) / scale, tt]) });
 }
 function ballMetric(x, y) {
   const c = toCourt(x, y); if (c) return c;
@@ -469,18 +473,23 @@ function updateBall(m, t) {
   let ref = null; for (let i = b.hist.length - 2; i >= 0; i--) { if (t - b.hist[i].t >= 150) { ref = b.hist[i]; break; } }
   if (ref && t - ref.t < 450) {
     const kmh = Math.hypot(b.hist[b.hist.length - 1].p[0] - ref.p[0], b.hist[b.hist.length - 1].p[1] - ref.p[1]) / ((t - ref.t) / 1000) * 3.6;
-    if (kmh <= s.speed[1] * 1.15) b.kmh = lerp(b.kmh, kmh, 0.6);
+    if (kmh <= s.speed[1] * 1.15) {
+      b.kmh = lerp(b.kmh, kmh, 0.6);
+      (b.ks ||= []).push(kmh); if (b.ks.length > 7) b.ks.shift();
+      const med = b.ks.slice().sort((p, q) => p - q)[b.ks.length >> 1]; b.kmhS = lerp(b.kmhS || med, med, 0.25);
+    }
   }
   // shot events: a burst of speed => SHOT/BALL SPEED + lock on nearest player
   const sh = G.shot;
   if (!sh.win && b.kmh > s.shotKmh && t - (sh.evT || 0) > 900) {
     let near = null, nd = 1e12; for (const k of G.tracks) { if (k.slot < 0) continue; const d = Math.hypot(k.x - b.x, (k.y - k.h * 0.4) - b.y) / k.h; if (d < nd) { nd = d; near = k; } }
-    sh.win = { t0: t, peak: b.kmh, who: nd < 2.5 ? near : null };
+    sh.win = { t0: t, peak: b.kmh, ks: [b.kmh], who: nd < 2.5 ? near : null };
   }
   if (sh.win) {
-    sh.win.peak = Math.max(sh.win.peak, b.kmh);
+    sh.win.peak = Math.max(sh.win.peak, b.kmh); sh.win.ks.push(b.kmh);
     if (t - sh.win.t0 > 350) {
-      const v = clamp(sh.win.peak, s.speed[0], s.speed[1]); setShot(v, t); sh.evT = t; sh.burst = { x: b.x, y: b.y, t, kmh: Math.round(v) };
+      const ks = sh.win.ks.slice().sort((p, q) => p - q), robust = ks[Math.min(ks.length - 1, Math.floor(ks.length * 0.75))];
+      const v = clamp(robust, s.speed[0], s.speed[1]); setShot(v, t); sh.evT = t; sh.burst = { x: b.x, y: b.y, t, kmh: Math.round(v) };
       if (sh.win.who) lockOn(sh.win.who, v, t);
       sh.win = null;
     }
@@ -676,43 +685,106 @@ function drawLock(k, pl, t, tagBox) {
 }
 
 /* ---------------- ball ---------------- */
+/* ---------------- ball: game-style smooth marker, arcing trail, impact bursts, speed pop ---------------- */
+const SPD_STOPS = [[0, [216, 255, 61]], [70, [180, 255, 90]], [110, [255, 226, 77]], [150, [255, 150, 46]], [190, [255, 61, 110]], [230, [255, 77, 255]]];
+function spdRGB(k) {
+  if (!(k > 0)) return SPD_STOPS[0][1];
+  for (let i = 1; i < SPD_STOPS.length; i++) if (k <= SPD_STOPS[i][0]) { const [k0, c0] = SPD_STOPS[i - 1], [k1, c1] = SPD_STOPS[i], q = (k - k0) / (k1 - k0); return c0.map((v, j) => Math.round(v + (c1[j] - v) * q)); }
+  return SPD_STOPS[SPD_STOPS.length - 1][1];
+}
+const rgba = (c, a) => `rgba(${c[0]},${c[1]},${c[2]},${Math.max(0, Math.min(1, a)).toFixed(3)})`;
+// Catmull-Rom (centripetal-ish, uniform here) through screen points -> dense polyline
+function crSample(P, per) {
+  const out = []; if (P.length < 2) return P.slice();
+  for (let i = 0; i < P.length - 1; i++) {
+    const p0 = P[Math.max(0, i - 1)], p1 = P[i], p2 = P[i + 1], p3 = P[Math.min(P.length - 1, i + 2)];
+    for (let s = 0; s < per; s++) {
+      const u = s / per, u2 = u * u, u3 = u2 * u;
+      const f = (a, b, c, d) => 0.5 * (2 * b + (-a + c) * u + (2 * a - 5 * b + 4 * c - d) * u2 + (-a + 3 * b - 3 * c + d) * u3);
+      out.push({ x: f(p0.x, p1.x, p2.x, p3.x), y: f(p0.y, p1.y, p2.y, p3.y), t: p1.t + (p2.t - p1.t) * u, a: p1.a + (p2.a - p1.a) * u, k: p1.k + (p2.k - p1.k) * u });
+    }
+  }
+  out.push(P[P.length - 1]); return out;
+}
+const popEase = (q) => { const c1 = 1.9, c3 = c1 + 1; return 1 + c3 * Math.pow(q - 1, 3) + c1 * Math.pow(q - 1, 2); };
+let lastBurstT = 0, lastEvT = 0, popShotT = 0;
+function addFx(x, y, t, kind, k) { if (G.fx.length > 8) G.fx.shift(); G.fx.push({ x, y, t, kind, k }); }
 function drawBall(t) {
-  const b = G.ball, s = sp(); if (!b) return;
-  const col = S.sport === 'tennis' ? '#d8ff3d' : '#e9fbff', age = t - b.t; if (age > 900) return;
-  const fade = age > 500 ? 1 - (age - 500) / 400 : 1;
-  ctx.save(); ctx.globalCompositeOperation = 'lighter'; ctx.lineCap = 'round';
-  const tr = b.trail;
-  for (let i = 1; i < tr.length; i++) {
-    const a = 1 - (t - tr[i].t) / 700; if (a <= 0) continue;
-    const [x0, y0] = v2c(tr[i - 1].x, tr[i - 1].y), [x1, y1] = v2c(tr[i].x, tr[i].y);
-    ctx.strokeStyle = hexA(s.accent, a * 0.35 * fade); ctx.lineWidth = (0.6 + 1.6 * a) * U; ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke();
-    ctx.strokeStyle = `rgba(255,255,255,${a * 0.8 * fade})`; ctx.lineWidth = (0.15 + 0.4 * a) * U; ctx.stroke();
+  const s = sp(), b = G.ball;
+  BD.setFrame(VW, VH); BD.kmh = b && b.kmhS ? b.kmhS : (b ? b.kmh : 0);
+  const r = BD.render(t), TR = BD.trailPts(t), TMS = BD.o.trailMs;
+  const football = S.sport === 'football';
+  ctx.save(); ctx.globalCompositeOperation = 'lighter'; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  // ---- trail: per segment, decimate to ~30 ms knots, spline, tapered + glow, colour by speed
+  let seg = [];
+  const flush = () => {
+    if (seg.length < 2) { seg = []; return; }
+    const knots = [seg[0]]; for (const p of seg) if (p.t - knots[knots.length - 1].t >= 28) knots.push(p);
+    if (knots[knots.length - 1] !== seg[seg.length - 1]) knots.push(seg[seg.length - 1]);
+    const P = crSample(knots.map((p) => { const [x, y] = v2c(p.x, p.y); return { x, y, t: p.t, a: p.a, k: p.k }; }), 6);
+    for (let pass = 0; pass < 2; pass++) for (let i = 1; i < P.length; i++) {
+      const q = 1 - (t - P[i].t) / TMS; if (q <= 0) continue; // 0 = oldest .. 1 = newest
+      const al = q * q * P[i].a, c = spdRGB(P[i].k);
+      ctx.beginPath(); ctx.moveTo(P[i - 1].x, P[i - 1].y); ctx.lineTo(P[i].x, P[i].y);
+      if (pass === 0) { ctx.strokeStyle = rgba(c, al * 0.32); ctx.lineWidth = (0.5 + 2.6 * q) * U; } // soft glow
+      else { ctx.strokeStyle = rgba([255, 255, 255].map((v, j) => Math.round(v * 0.55 + c[j] * 0.45)), al * 0.95); ctx.lineWidth = (0.12 + 0.75 * q) * U; } // bright core
+      ctx.stroke();
+    }
+    seg = [];
+  };
+  for (const p of TR) { if (seg.length && p.seg !== seg[seg.length - 1].seg) flush(); seg.push(p); }
+  if (r && seg.length) seg.push({ x: r.x, y: r.y, t, a: r.a, seg: r.seg, k: BD.kmh }); // trail ends exactly at the marker
+  flush();
+  // ---- impacts: hits / bounces from the smoother + shot events
+  if (BD.ev && BD.ev.t !== lastEvT) { lastEvT = BD.ev.t; addFx(BD.ev.x, BD.ev.y, t, BD.ev.kind, BD.kmh); }
+  const sb = G.shot.burst; if (sb && sb.t !== lastBurstT) { lastBurstT = sb.t; const v = BD.vis && t - BD.vis.t < 100 ? BD.vis : sb; addFx(v.x, v.y, t, 'shot', sb.kmh); popShotT = t; }
+  G.fx = G.fx.filter((f) => t - f.t < 650);
+  for (const f of G.fx) {
+    const q = (t - f.t) / 650, e = 1 - Math.pow(1 - q, 3), [fx, fy] = v2c(f.x, f.y), c = f.kind === 'shot' ? spdRGB(f.k) : [255, 255, 255];
+    const big = f.kind === 'shot' ? 1.4 : 0.8;
+    if (q < 0.18) { const g = ctx.createRadialGradient(fx, fy, 0, fx, fy, 4.5 * U * big); g.addColorStop(0, rgba([255, 255, 255], 0.6 * (1 - q / 0.18))); g.addColorStop(1, rgba(c, 0)); ctx.fillStyle = g; ctx.beginPath(); ctx.arc(fx, fy, 4.5 * U * big, 0, 7); ctx.fill(); } // flash
+    ctx.strokeStyle = rgba(c, (1 - q) * 0.9); ctx.lineWidth = (1 - q) * 0.9 * U * big;
+    ctx.beginPath(); ctx.arc(fx, fy, (1.5 + e * 9) * U * big, 0, 7); ctx.stroke();
+    ctx.strokeStyle = rgba([255, 255, 255], (1 - q) * 0.6); ctx.lineWidth = (1 - q) * 0.35 * U;
+    ctx.beginPath(); ctx.arc(fx, fy, (1 + e * 5.5) * U * big, 0, 7); ctx.stroke();
+    for (let i = 0; i < 8; i++) { // sparks
+      const an = i * Math.PI / 4 + f.t * 0.001, r0 = (2 + e * 6) * U * big, r1 = r0 + (1 - q) * 2.2 * U * big;
+      ctx.beginPath(); ctx.moveTo(fx + Math.cos(an) * r0, fy + Math.sin(an) * r0); ctx.lineTo(fx + Math.cos(an) * r1, fy + Math.sin(an) * r1); ctx.stroke();
+    }
   }
-  const pb = predBall(t), [bx, by] = v2c(...(age < 250 ? pb : [b.x, b.y]));
-  const r = Math.max(0.9 * U, b.r * vs);
-  const g = ctx.createRadialGradient(bx, by, 0, bx, by, r * 3); g.addColorStop(0, hexA(col, 0.9 * fade)); g.addColorStop(0.35, hexA(s.accent, 0.35 * fade)); g.addColorStop(1, hexA(s.accent, 0));
-  ctx.fillStyle = g; ctx.beginPath(); ctx.arc(bx, by, r * 3, 0, Math.PI * 2); ctx.fill();
-  // spinning reticle
-  ctx.strokeStyle = hexA(s.accent, 0.9 * fade); ctx.lineWidth = 0.25 * U; ctx.setLineDash([1.2 * U, 0.9 * U]); ctx.lineDashOffset = t * 0.02 * U;
-  ctx.beginPath(); ctx.arc(bx, by, r * 2.1, 0, Math.PI * 2); ctx.stroke(); ctx.setLineDash([]);
-  ctx.restore();
-  // speed popup
-  const show = b.kmh > s.shotKmh * 0.6;
-  if (show) {
-    const txt = `${Math.round(b.kmh)}`; ctx.save(); ctx.globalAlpha = fade;
-    ctx.font = F(3 * U, 700, true); const tw = ctx.measureText(txt).width; const w = tw + 9 * U, h = 4.4 * U, x = bx + r * 2.6, y = by - r * 2.6 - h;
-    ctx.save(); ctx.shadowColor = s.accent; ctx.shadowBlur = U; rr(x, y, w, h, h / 2); ctx.fillStyle = 'rgba(5,14,36,0.85)'; ctx.fill(); ctx.restore();
-    rr(x, y, w, h, h / 2); ctx.strokeStyle = s.accent; ctx.lineWidth = 0.2 * U; ctx.stroke();
-    ctx.textBaseline = 'middle'; ctx.fillStyle = '#fff'; ctx.textAlign = 'left'; ctx.fillText(txt, x + 1.4 * U, y + h / 2);
-    ctx.font = F(1.6 * U, 700); ctx.fillStyle = s.accent; ctx.fillText('km/h est.', x + 1.8 * U + tw, y + h / 2 + 0.2 * U);
+  // ---- the ball: soft glowing halo, stretched along its motion, gentle pulse
+  if (r) {
+    const [bx, by] = v2c(r.x, r.y), c = spdRGB(BD.kmh), al = r.a;
+    const rad = Math.max(0.9 * U, (b ? b.r : 4) * vs) * (1 + 0.06 * Math.sin(t * 0.012));
+    const sp_ = Math.hypot(r.vx, r.vy) * vs, stretch = clamp(1 + sp_ / (900 * U / 3), 1, 2.2), ang = Math.atan2(r.vy, r.vx);
+    ctx.save(); ctx.translate(bx, by); ctx.rotate(ang); ctx.scale(stretch, 1 / Math.sqrt(stretch));
+    const g = ctx.createRadialGradient(0, 0, 0, 0, 0, rad * 4.2);
+    g.addColorStop(0, rgba([255, 255, 255], 0.95 * al)); g.addColorStop(0.18, rgba(c, 0.8 * al)); g.addColorStop(0.5, rgba(c, 0.22 * al)); g.addColorStop(1, rgba(c, 0));
+    ctx.fillStyle = g; ctx.beginPath(); ctx.arc(0, 0, rad * 4.2, 0, 7); ctx.fill();
     ctx.restore();
+    ctx.fillStyle = rgba(football ? [255, 255, 255] : [235, 255, 150], al); ctx.beginPath(); ctx.arc(bx, by, rad * 0.9, 0, 7); ctx.fill();
+    ctx.strokeStyle = rgba(c, 0.85 * al); ctx.lineWidth = 0.22 * U; ctx.setLineDash([1.2 * U, 0.9 * U]); ctx.lineDashOffset = t * 0.02 * U;
+    ctx.beginPath(); ctx.arc(bx, by, rad * 2.3, 0, 7); ctx.stroke(); ctx.setLineDash([]);
   }
-  // shot burst
-  const sb = G.shot.burst;
-  if (sb && t - sb.t < 700) {
-    const q = (t - sb.t) / 700, [sx, sy] = v2c(sb.x, sb.y);
-    ctx.save(); ctx.globalCompositeOperation = 'lighter'; ctx.strokeStyle = hexA(s.accent, 1 - q); ctx.lineWidth = (1 - q) * U;
-    ctx.beginPath(); ctx.arc(sx, sy, (2 + q * 12) * U, 0, Math.PI * 2); ctx.stroke(); ctx.restore();
+  ctx.restore();
+  // ---- game-style speed pop: scales in on each shot, follows the ball, then fades (no live jitter)
+  const pt = t - popShotT;
+  if (popShotT && G.shot.val && pt < 1700) {
+    const at = r ? v2c(r.x, r.y) : (sb ? v2c(sb.x, sb.y) : null);
+    if (at) {
+      const sc = pt < 260 ? popEase(pt / 260) : 1, al = pt > 1300 ? 1 - (pt - 1300) / 400 : 1, c = spdRGB(G.shot.val);
+      const txt = `${G.shot.val}`;
+      ctx.save(); ctx.globalAlpha = Math.max(0, al);
+      const px = at[0] + 3.2 * U, py = at[1] - 5.5 * U; ctx.translate(px, py); ctx.scale(sc, sc); ctx.rotate(-0.06);
+      ctx.font = F(4.2 * U, 800, true); const tw = ctx.measureText(txt).width; ctx.font = F(1.5 * U, 800); const uw = ctx.measureText('km/h est.').width;
+      const w = tw + uw + 4.6 * U, h = 5.4 * U;
+      ctx.save(); ctx.shadowColor = rgba(c, 0.9); ctx.shadowBlur = 1.6 * U; rr(0, -h, w, h, h / 2); ctx.fillStyle = 'rgba(6,12,32,0.88)'; ctx.fill(); ctx.restore();
+      rr(0, -h, w, h, h / 2); ctx.strokeStyle = rgba(c, 1); ctx.lineWidth = 0.32 * U; ctx.stroke();
+      ctx.textBaseline = 'middle'; ctx.textAlign = 'left'; ctx.font = F(4.2 * U, 800, true);
+      ctx.fillStyle = rgba(c, 1); ctx.fillText(txt, 1.6 * U + 0.15 * U, -h / 2 + 0.15 * U); ctx.fillStyle = '#fff'; ctx.fillText(txt, 1.6 * U, -h / 2);
+      ctx.font = F(1.5 * U, 800); ctx.fillStyle = rgba(c, 1); ctx.fillText('km/h est.', 2.4 * U + tw, -h / 2 + 0.5 * U);
+      ctx.restore();
+    }
   }
 }
 
@@ -828,7 +900,7 @@ function drawMap(t, R) {
     ctx.fillStyle = p.color; ctx.beginPath(); ctx.arc(mx, my, pr, 0, 7); ctx.fill(); ctx.strokeStyle = '#fff'; ctx.lineWidth = 0.2 * U; ctx.stroke();
     if (G.lock.tid === k_.id && t - G.lock.t < 3000) { ctx.strokeStyle = '#ffd23d'; ctx.lineWidth = 0.25 * U; ctx.beginPath(); ctx.arc(mx, my, pr * 2.2, 0, 7); ctx.stroke(); }
   });
-  if (G.ball && t - G.ball.t < 800) { const c = toCourt(G.ball.x, G.ball.y); if (c || true) { const [mx, my] = toMap(G.ball.x, G.ball.y, c); ctx.fillStyle = S.sport === 'tennis' ? '#d8ff3d' : '#fff'; ctx.beginPath(); ctx.arc(mx, my, 0.7 * U, 0, 7); ctx.fill(); } }
+  if (BD.vis && t - BD.vis.t < 60) { const c = toCourt(BD.vis.x, BD.vis.y); if (c || true) { const [mx, my] = toMap(BD.vis.x, BD.vis.y, c); ctx.fillStyle = S.sport === 'tennis' ? '#d8ff3d' : '#fff'; ctx.beginPath(); ctx.arc(mx, my, 0.7 * U, 0, 7); ctx.fill(); } }
   ctx.restore();
   ctx.font = F(1.5 * U, 500); ctx.fillStyle = '#7fb6cc'; ctx.textAlign = 'left'; ctx.fillText('ทีม A', x + 1.4 * U, y + h - 0.8 * U); ctx.textAlign = 'right'; ctx.fillText('ทีม B', x + w - 1.4 * U, y + h - 0.8 * U);
 }
